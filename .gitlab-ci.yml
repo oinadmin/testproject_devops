@@ -1,0 +1,72 @@
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+include:
+- template: Security/SAST.gitlab-ci.yml
+
+stages:
+- sast
+- test
+- build
+- deploy
+
+pytest:
+  stage: test
+  image: python:3.14.5-alpine3.23
+  before_script:
+    - pip install --upgrade pip
+    - pip install --no-cache-dir -r requirements.txt
+  script:
+    - pytest --junitxml=report.xml tests/
+  artifacts:
+    reports:
+      junit: report.xml
+
+sast:
+  stage: sast 
+
+build:
+  stage: build
+  image: docker:27-cli
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_BUILDKIT: "1"
+  before_script:
+    - until docker info >/dev/null 2>&1; do sleep 2; done
+    - echo "$CI_JOB_TOKEN" | docker login "$CI_REGISTRY" -u gitlab-ci-token --password-stdin
+    - docker buildx rm -f ci-builder 2>/dev/null || true
+    - docker buildx create --name ci-builder --driver docker-container --use --bootstrap
+  script:
+    - |
+      docker buildx build \
+        --file Dockerfile \
+        --cache-from "type=registry,ref=${CI_REGISTRY_IMAGE}:buildcache" \
+        --cache-to "type=registry,ref=${CI_REGISTRY_IMAGE}:buildcache,mode=max" \
+        --tag "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}" \
+        --tag "${CI_REGISTRY_IMAGE}:latest" \
+        --provenance=false \
+        --push \
+        .
+
+deploy:
+  stage: deploy
+  tags:
+    - minipc
+  script:
+    - cd /home/gvodolagin/test_project
+    - echo "$CI_JOB_TOKEN" | docker login "$CI_REGISTRY" -u gitlab-ci-token --password-stdin
+    - export API_IMAGE="${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+    - docker compose pull api
+    - docker compose down api
+    - docker compose up -d api
+    - |
+      RETRIES=10
+      while [ $RETRIES -gt 0 ] && ! curl -s -f http://localhost:8000/health >/dev/null; do
+        sleep 3
+        RETRIES=$((RETRIES - 1))
+      done
+      [ $RETRIES -eq 0 ] && echo "API healthcheck failed!" && exit 1
+    - docker image prune -f
